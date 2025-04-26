@@ -37,7 +37,8 @@ enum Commands {
 
 fn check_permissions() -> Result<()> {
     let hosts_path = get_hosts_path()?; // Get the path once
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         // Basic check: Can we open the hosts file for writing?
         // A more robust check involves checking the user's token, but this is simpler.
         match std::fs::OpenOptions::new()
@@ -50,14 +51,18 @@ fn check_permissions() -> Result<()> {
             }
             Err(e) => Err(AppError::Io(format!("Error checking permissions on {:?}: {}", hosts_path, e))), // Convert error to string
         }
-    } else if cfg!(unix) {
+    }
+    #[cfg(unix)] // Add cfg attribute for Unix block
+    {
         // Check if the effective user ID is root (0)
         if !nix::unistd::Uid::effective().is_root() {
             Err(AppError::PermissionDenied(hosts_path)) // Pass the path
         } else {
             Ok(())
         }
-    } else {
+    }
+    #[cfg(not(any(unix, windows)))] // Handle other OSes
+    {
         // Assume permissions are okay on unknown platforms for now
         println!("Warning: Unknown platform, cannot reliably check permissions.");
         Ok(())
