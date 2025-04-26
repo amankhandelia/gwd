@@ -7,7 +7,6 @@
 - [x] Forces user to write a string of random words to unblock the website
 
 ## Future features
-- [ ] Integrate a TUI, currently its just a powershell script
 - [ ] Make it cross-platform (currently only Windows)
 - [ ] Make it installable via package managers
 - [ ] Host the blocklist on `gist.github.com` so that it can work across devices

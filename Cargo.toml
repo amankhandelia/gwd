@@ -1,0 +1,23 @@
+[package]
+name = "gwd"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] } # For CLI argument parsing
+rand = "0.8.5" # For random challenge words
+thiserror = "1.0.59" # For error handling
+lazy_static = "1.4.0" # For static HOSTS_PATH determination
+regex = "1.10.4" # For robust parsing of hosts file lines
+
+[target.'cfg(windows)'.dependencies]
+# Add windows-specific dependencies if needed later, e.g., for privilege checks
+
+[target.'cfg(unix)'.dependencies]
+# Add unix-specific dependencies if needed later, e.g., for privilege checks
+nix = { version = "0.28.0", features = ["user"] } # To check if running as root on Unix
+
+[dev-dependencies]
+tempfile = "3.10.1" # Added for testing file I/O
