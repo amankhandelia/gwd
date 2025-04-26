@@ -33,13 +33,13 @@ Blocking/Unblocking might require flushing the DNS cache (`ipconfig /flushdns`) 
 #>
 [CmdletBinding(DefaultParameterSetName = 'Help')]
 param(
-    [Parameter(Mandatory=$true, ParameterSetName='Block', HelpMessage = 'Website domain to block (e.g., example.com)')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Block', HelpMessage = 'Website domain to block (e.g., example.com)')]
     [string]$Block,
 
-    [Parameter(Mandatory=$true, ParameterSetName='Unblock', HelpMessage = 'Website domain to unblock (e.g., example.com)')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Unblock', HelpMessage = 'Website domain to unblock (e.g., example.com)')]
     [string]$Unblock,
 
-    [Parameter(Mandatory=$true, ParameterSetName='Help')]
+    [Parameter(Mandatory = $true, ParameterSetName = 'Help')]
     [switch]$Help
 )
 
@@ -134,13 +134,13 @@ Function Test-IsAdmin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-Function Sanitize-Domain ([string]$Domain) {
+Function Format-DomainForHosts ([string]$Domain) {
     # Remove http/https and trailing slashes, convert to lowercase
     return $Domain.ToLower().Replace("http://", "").Replace("https://", "").TrimEnd('/')
 }
 
 Function Block-Website ([string]$Domain) {
-    $cleanDomain = Sanitize-Domain $Domain
+    $cleanDomain = Format-DomainForHosts $Domain
     if (-not $cleanDomain) {
         Write-Error "Invalid domain name provided: '$Domain'"
         return
@@ -149,8 +149,10 @@ Function Block-Website ([string]$Domain) {
     $domainWww = "www.$cleanDomain"
 
     try {
+        # Read the entire content first
         $hostsContent = Get-Content $hostsFilePath -ErrorAction Stop
-    } catch {
+    }
+    catch {
         Write-Error "Failed to read hosts file: $($_.Exception.Message). Ensure you are running as Administrator."
         return
     }
@@ -159,48 +161,68 @@ Function Block-Website ([string]$Domain) {
     $entry2 = "$redirectIp $domainWww $blockCommentTag"
 
     $needsUpdate = $false
+    # Use a temporary list to hold lines to add
     $linesToAdd = New-Object System.Collections.Generic.List[string]
 
-    # Check if entries already exist (case-insensitive check, ignoring comments)
-    $exists1 = $hostsContent | Where-Object { $_ -match "^\s*$redirectIp\s+$([regex]::escape($cleanDomain))\s*(#.*)?$" }
-    $exists2 = $hostsContent | Where-Object { $_ -match "^\s*$redirectIp\s+$([regex]::escape($domainWww))\s*(#.*)?$" }
+    # Check if entries already exist (case-insensitive check, ignoring comments, ensuring full domain match)
+    # Match lines starting with the redirect IP, followed by space(s), then the exact domain,
+    # then optionally a space and comment, or just the end of the line.
+    $exists1 = $hostsContent | Where-Object { $_ -match "^\s*$([regex]::escape($redirectIp))\s+$([regex]::escape($cleanDomain))(\s+|$)(\s*#.*)?$" }
+    $exists2 = $hostsContent | Where-Object { $_ -match "^\s*$([regex]::escape($redirectIp))\s+$([regex]::escape($domainWww))(\s+|$)(\s*#.*)?$" }
+
 
     if (-not $exists1) {
         $linesToAdd.Add($entry1)
         $needsUpdate = $true
         Write-Host "Adding entry: $entry1" -ForegroundColor Yellow
-    } else {
-         Write-Host "Block entry for $cleanDomain already seems to exist." -ForegroundColor Green
+    }
+    else {
+        Write-Host "Block entry for $cleanDomain already seems to exist." -ForegroundColor Green
     }
 
     if (-not $exists2) {
-         $linesToAdd.Add($entry2)
-         $needsUpdate = $true
-         Write-Host "Adding entry: $entry2" -ForegroundColor Yellow
-    } else {
-         Write-Host "Block entry for $domainWww already seems to exist." -ForegroundColor Green
+        $linesToAdd.Add($entry2)
+        $needsUpdate = $true
+        Write-Host "Adding entry: $entry2" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "Block entry for $domainWww already seems to exist." -ForegroundColor Green
     }
 
     if ($needsUpdate) {
         try {
-            # Ensure newline if file doesn't end with one
-            if ($hostsContent.Count -gt 0 -and $hostsContent[-1] -ne '') {
-                Add-Content $hostsFilePath "" # Add a blank line first
+            # Prepare the final content by adding new lines to the original content
+            $finalContent = [System.Collections.Generic.List[string]]::new() # Create an empty list
+            
+            # Add existing content line by line to avoid AddRange type issues
+            foreach ($line in $hostsContent) {
+                $finalContent.Add($line)
             }
-            Add-Content $hostsFilePath -Value $linesToAdd -ErrorAction Stop
+
+            # Add a blank line before new entries if the file doesn't end with one and has content
+            if ($finalContent.Count -gt 0 -and $finalContent[-1].Trim() -ne '') {
+                $finalContent.Add("")
+            }
+            # Add the new entries
+            $finalContent.AddRange($linesToAdd)
+
+            # Write the entire modified content back using Set-Content with ASCII encoding (safer for hosts file)
+            Set-Content -Path $hostsFilePath -Value $finalContent -Encoding Ascii -ErrorAction Stop
             Write-Host "Successfully updated hosts file to block '$cleanDomain' and '$domainWww'." -ForegroundColor Green
             Write-Host "Run 'ipconfig /flushdns' if the block doesn't take effect immediately." -ForegroundColor Cyan
-        } catch {
+        }
+        catch {
             Write-Error "Failed to write to hosts file: $($_.Exception.Message)"
         }
-    } else {
+    }
+    else {
         Write-Host "'$cleanDomain' and '$domainWww' appear to be already configured for blocking." -ForegroundColor Green
     }
 }
 
 Function Unblock-Website ([string]$Domain) {
-    $cleanDomain = Sanitize-Domain $Domain
-     if (-not $cleanDomain) {
+    $cleanDomain = Format-DomainForHosts $Domain
+    if (-not $cleanDomain) {
         Write-Error "Invalid domain name provided: '$Domain'"
         return
     }
@@ -229,7 +251,6 @@ Function Unblock-Website ([string]$Domain) {
 
     try {
         $hostsContent = Get-Content $hostsFilePath -ErrorAction Stop
-        $originalCount = $hostsContent.Count
         $newContent = @()
         $removedCount = 0
 
@@ -238,29 +259,34 @@ Function Unblock-Website ([string]$Domain) {
             # Match lines starting with the redirect IP, followed by space(s), then the exact domain,
             # then optionally a space and comment, or just the end of the line.
             if ($line -match "^\s*$redirectIp\s+$([regex]::escape($cleanDomain))(\s|$)") {
-                 Write-Host "Removing line: $line" -ForegroundColor Yellow
-                 $removedCount++
-            } elseif ($line -match "^\s*$redirectIp\s+$([regex]::escape($domainWww))(\s|$)") {
-                 Write-Host "Removing line: $line" -ForegroundColor Yellow
-                 $removedCount++
-            } else {
+                Write-Host "Removing line: $line" -ForegroundColor Yellow
+                $removedCount++
+            }
+            elseif ($line -match "^\s*$redirectIp\s+$([regex]::escape($domainWww))(\s|$)") {
+                Write-Host "Removing line: $line" -ForegroundColor Yellow
+                $removedCount++
+            }
+            else {
                 $newContent += $line
             }
         }
 
         if ($removedCount -gt 0) {
-             try {
+            try {
                 Set-Content -Path $hostsFilePath -Value $newContent -Encoding Default -ErrorAction Stop # Use default encoding, often ANSI for hosts
                 Write-Host "Successfully removed $removedCount blocking entries for '$cleanDomain' and '$domainWww' from hosts file." -ForegroundColor Green
                 Write-Host "Run 'ipconfig /flushdns' if you still cannot access the site." -ForegroundColor Cyan
-             } catch {
-                 Write-Error "Failed to write updated content to hosts file: $($_.Exception.Message)"
-             }
-        } else {
+            }
+            catch {
+                Write-Error "Failed to write updated content to hosts file: $($_.Exception.Message)"
+            }
+        }
+        else {
             Write-Host "No active blocking entries found for '$cleanDomain' or '$domainWww' managed by this script." -ForegroundColor Yellow
         }
 
-    } catch {
+    }
+    catch {
         Write-Error "Failed to read hosts file: $($_.Exception.Message). Ensure you are running as Administrator."
         return
     }
@@ -282,9 +308,10 @@ if (-not (Test-Path $hostsFilePath)) {
 # Simple write check (can be improved, but admin check is primary)
 try {
     [IO.File]::Open($hostsFilePath, 'Open', 'ReadWrite', 'None').Close()
-} catch {
-     Write-Error "Cannot get write access to hosts file at '$hostsFilePath', even running as Admin. Check permissions or if file is locked."
-     Exit 1
+}
+catch {
+    Write-Error "Cannot get write access to hosts file at '$hostsFilePath', even running as Admin. Check permissions or if file is locked."
+    Exit 1
 }
 
 
@@ -300,6 +327,6 @@ switch ($PSCmdlet.ParameterSetName) {
         Show-Help
     }
     Default {
-         Show-Help # Show help if no valid parameters are provided
+        Show-Help # Show help if no valid parameters are provided
     }
 }
