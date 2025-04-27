@@ -1,0 +1,257 @@
+name: Release gwd
+
+on:
+  push:
+    tags:
+      - 'v*.*.*' # Trigger on version tags like v0.1.0
+
+permissions:
+  contents: write # Needed to create releases and upload assets
+
+jobs:
+  build-binaries:
+    name: Build Binaries (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_suffix: linux-amd64
+            binary_name: gwd
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            artifact_suffix: windows-amd64
+            binary_name: gwd.exe
+          - os: macos-latest # Assumes x86_64 runner
+            target: x86_64-apple-darwin
+            artifact_suffix: macos-amd64
+            binary_name: gwd
+          - os: macos-latest # Build ARM on x86_64 runner via cross-compilation
+            target: aarch64-apple-darwin
+            artifact_suffix: macos-arm64
+            binary_name: gwd
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }} # Install target for cross-compilation if needed
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          # Needed for cross-compiling to aarch64-apple-darwin from x86_64-apple-darwin
+          # May require installing SDKs or specific linkers depending on runner setup
+          # If this fails, consider using a dedicated ARM runner like macos-14 if available
+          SDKROOT: $(xcrun --sdk macosx --show-sdk-path)
+          MACOSX_DEPLOYMENT_TARGET: $(xcrun --sdk macosx --show-sdk-platform-version)
+        if: matrix.target == 'aarch64-apple-darwin' && runner.os == 'macOS'
+
+      - name: Build binary (default)
+        run: cargo build --release --target ${{ matrix.target }}
+        if: matrix.target != 'aarch64-apple-darwin' || runner.os != 'macOS'
+
+      - name: Prepare artifact directory
+        run: mkdir -p artifacts
+
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} artifacts/
+          cd artifacts
+          tar czf gwd-${{ matrix.artifact_suffix }}.tar.gz ${{ matrix.binary_name }}
+          sha256sum gwd-${{ matrix.artifact_suffix }}.tar.gz > gwd-${{ matrix.artifact_suffix }}.sha256
+          cd ..
+
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh # Use PowerShell for consistency
+        run: |
+          Copy-Item "target\\${{ matrix.target }}\\release\\${{ matrix.binary_name }}" -Destination "artifacts\\"
+          Compress-Archive -Path "artifacts\\${{ matrix.binary_name }}" -DestinationPath "artifacts\\gwd-${{ matrix.artifact_suffix }}.zip"
+          Get-FileHash -Algorithm SHA256 "artifacts\\gwd-${{ matrix.artifact_suffix }}.zip" | Select-Object -ExpandProperty Hash | Out-File -Encoding Ascii "artifacts\\gwd-${{ matrix.artifact_suffix }}.sha256"
+          # Remove newline from sha256 file
+          (Get-Content "artifacts\\gwd-${{ matrix.artifact_suffix }}.sha256").Trim() | Set-Content -Encoding Ascii "artifacts\\gwd-${{ matrix.artifact_suffix }}.sha256"
+
+
+      - name: Upload artifact for release
+        uses: actions/upload-artifact@v4
+        with:
+          name: gwd-release-assets-${{ matrix.artifact_suffix }}
+          path: |
+            artifacts/gwd-${{ matrix.artifact_suffix }}.*
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Download all release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: gwd-release-assets-*
+          merge-multiple: true # Merge all downloaded artifacts into release-assets directory
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/* # Upload all archives and checksums
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-packages:
+    name: Update Package Managers
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT # Get version without 'v' prefix
+
+      - name: Download all release assets (needed for checksums)
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: gwd-release-assets-*
+          merge-multiple: true
+
+      # --- Update Homebrew Tap ---
+      - name: Checkout Homebrew tap repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-gwd # Replace with your tap repo name if different
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Homebrew formula
+        run: |
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          REPO_OWNER=${{ github.repository_owner }}
+          REPO_NAME=${{ github.event.repository.name }}
+
+          # Get checksums - assumes files exist after download artifact step
+          SHA256_AMD64=$(cat release-assets/gwd-macos-amd64.sha256)
+          SHA256_ARM64=$(cat release-assets/gwd-macos-arm64.sha256)
+
+          # URLs for the release assets
+          URL_AMD64="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${VERSION}/gwd-macos-amd64.tar.gz"
+          URL_ARM64="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${VERSION}/gwd-macos-arm64.tar.gz"
+
+          # Create/Update the formula file (simple template)
+          cat << EOF > homebrew-tap/Formula/gwd.rb
+          # typed: false
+          # frozen_string_literal: true
+
+          class Gwd < Formula
+            desc "Get Work Done - Block websites easily"
+            homepage "https://github.com/${REPO_OWNER}/${REPO_NAME}"
+            version "${VERSION}"
+
+            on_macos do
+              if Hardware::CPU.intel?
+                url "${URL_AMD64}"
+                sha256 "${SHA256_AMD64}"
+              end
+              if Hardware::CPU.arm?
+                url "${URL_ARM64}"
+                sha256 "${SHA256_ARM64}"
+              end
+            end
+
+            def install
+              bin.install "gwd"
+            end
+
+            test do
+              system "#{bin}/gwd", "--version"
+            end
+          end
+          EOF
+
+      - name: Commit and push Homebrew formula
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/gwd.rb
+          # Check if there are changes to commit
+          if ! git diff --staged --quiet; then
+            git commit -m "Update gwd formula to v${{ steps.get_version.outputs.VERSION }}"
+            git push
+          else
+            echo "No changes to Homebrew formula."
+          fi
+          cd ..
+
+      # --- Update Scoop Bucket ---
+      - name: Checkout Scoop bucket repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/scoop-gwd # Replace with your bucket repo name if different
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          path: scoop-bucket
+
+      - name: Update Scoop manifest
+        run: |
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          REPO_OWNER=${{ github.repository_owner }}
+          REPO_NAME=${{ github.event.repository.name }}
+
+          # Get checksum
+          SHA256_WINDOWS=$(cat release-assets/gwd-windows-amd64.sha256)
+
+          # URL for the release asset
+          URL_WINDOWS="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${VERSION}/gwd-windows-amd64.zip"
+
+          # Create/Update the manifest file (simple template)
+          # Note: Using jq would be more robust for JSON manipulation
+          cat << EOF > scoop-bucket/gwd.json
+          {
+              "version": "${VERSION}",
+              "description": "Get Work Done - Block websites easily",
+              "homepage": "https://github.com/${REPO_OWNER}/${REPO_NAME}",
+              "license": "MIT", # Assuming MIT, update if different
+              "architecture": {
+                  "64bit": {
+                      "url": "${URL_WINDOWS}",
+                      "hash": "${SHA256_WINDOWS}",
+                      "bin": "gwd.exe"
+                  }
+              },
+              "checkver": "github",
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": "https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v\$version/gwd-windows-amd64.zip"
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Commit and push Scoop manifest
+        run: |
+          cd scoop-bucket
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add gwd.json
+          # Check if there are changes to commit
+          if ! git diff --staged --quiet; then
+            git commit -m "Update gwd manifest to v${{ steps.get_version.outputs.VERSION }}"
+            git push
+          else
+            echo "No changes to Scoop manifest."
+          fi
+          cd ..
+
